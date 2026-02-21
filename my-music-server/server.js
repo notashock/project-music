@@ -1,133 +1,104 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const mm = require('music-metadata');
 
 const app = express();
 const PORT = 3000;
-const CONFIG_FILE = './config.json';
 
-app.use(express.urlencoded({ extended: true })); // To handle the form submission
+// Path to your metadata folder
+const METADATA_DIR = path.join(__dirname, 'metadata');
+const LIBRARY_PATH = path.join(METADATA_DIR, 'library.json');
+const THUMBNAILS_DIR = path.join(METADATA_DIR, 'thumbnails');
 
-// Helper: Get the saved path from config.json
-function getSavedPath() {
-    if (fs.existsSync(CONFIG_FILE)) {
-        const data = JSON.parse(fs.readFileSync(CONFIG_FILE));
-        return data.musicPath;
-    }
-    return null;
-}
+// 1. Serve Thumbnails as static files
+// This allows you to access images via http://localhost:3000/thumbs/image.jpg
+app.use('/thumbs', express.static(THUMBNAILS_DIR));
 
-// 1. MAIN ROUTE: Display list or ask for path
 app.get('/', (req, res) => {
-    const musicPath = getSavedPath();
-
-    if (!musicPath) {
-        // No path saved? Show the setup form
-        return res.send(`
-            <h1>Music Server Setup</h1>
-            <p>Please enter the full path to your music folder:</p>
-            <form action="/set-path" method="POST">
-                <input type="text" name="path" placeholder="C:/Users/Name/Music" style="width: 300px;" required>
-                <button type="submit">Save Path</button>
-            </form>
-        `);
+    if (!fs.existsSync(LIBRARY_PATH)) {
+        return res.status(404).send("<h1>library.json not found!</h1><p>Run your Python scanner first.</p>");
     }
 
-    // Path exists? Scan for MP3s
-    fs.readdir(musicPath, (err, files) => {
-        if (err) return res.status(500).send("Invalid path. <a href='/reset'>Reset Path</a>");
+    const library = JSON.parse(fs.readFileSync(LIBRARY_PATH, 'utf-8'));
+    
+    // Take the first 10 songs
+    const top10 = library.slice(0, 10);
 
-        const songs = files.filter(file => file.endsWith('.mp3'));
-        
-        let html = `<h1>Your Library</h1><ul>`;
-        songs.forEach(song => {
-            html += `<li><a href="/stream?name=${encodeURIComponent(song)}">${song}</a></li>`;
-        });
-        html += `</ul><p><a href="/reset">Change Folder</a></p>`;
-        
-        res.send(html);
+    let html = `
+    <html>
+    <head>
+        <title>My Scratch Music Server</title>
+        <style>
+            body { font-family: sans-serif; background: #121212; color: white; padding: 20px; }
+            .song-card { display: flex; align-items: center; background: #1e1e1e; margin-bottom: 10px; padding: 10px; border-radius: 8px; }
+            .song-card img { width: 60px; height: 60px; border-radius: 4px; margin-right: 15px; object-fit: cover; }
+            .info { flex-grow: 1; }
+            .info h4 { margin: 0; }
+            .info p { margin: 5px 0 0; color: #b3b3b3; font-size: 0.9em; }
+            audio { height: 30px; }
+        </style>
+    </head>
+    <body>
+        <h1>Recent 10 Songs</h1>
+    `;
+
+    top10.forEach(song => {
+        // We use the filename stored in library.json to create the stream link
+        const streamUrl = `/stream?path=${encodeURIComponent(song.full_path)}`;
+        // Fix thumbnail path for web (it likely has backslashes from Python/Windows)
+        const thumbName = song.thumbnail_path ? path.basename(song.thumbnail_path) : '';
+        const thumbUrl = thumbName ? `/thumbs/${thumbName}` : 'https://via.placeholder.com/60';
+
+        html += `
+            <div class="song-card">
+                <img src="${thumbUrl}" alt="Cover">
+                <div class="info">
+                    <h4>${song.title}</h4>
+                    <p>${song.artist} • ${song.album}</p>
+                </div>
+                <audio controls src="${streamUrl}"></audio>
+            </div>
+        `;
     });
+
+    html += `</body></html>`;
+    res.send(html);
 });
 
-// 2. SET PATH: Save the user's input
-app.post('/set-path', (req, res) => {
-    const newPath = req.body.path;
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ musicPath: newPath }));
-    res.redirect('/');
-});
-
-// 3. RESET: Clear the config
-app.get('/reset', (req, res) => {
-    if (fs.existsSync(CONFIG_FILE)) fs.unlinkSync(CONFIG_FILE);
-    res.redirect('/');
-});
-
-// 4. STREAM: Stream the requested file
+// 2. The Streaming Engine
 app.get('/stream', (req, res) => {
-    const songName = req.query.name;
-    const musicPath = getSavedPath();
-    const filePath = path.join(musicPath, songName);
+    const filePath = req.query.path;
 
-    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+    if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).send("File not found");
+    }
 
     const stat = fs.statSync(filePath);
-    const head = {
-        'Content-Length': stat.size,
-        'Content-Type': 'audio/mpeg',
-    };
-    res.writeHead(200, head);
-    fs.createReadStream(filePath).pipe(res);
-});
+    const range = req.headers.range;
 
-app.get('/api/songs', async (req, res) => {
-    const musicPath = getSavedPath();
-    if (!musicPath) return res.status(400).json({ error: "No path set" });
-
-    try {
-        const files = fs.readdirSync(musicPath).filter(file => file.endsWith('.mp3'));
+    if (range) {
+        const parts = range.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+        const chunksize = (end - start) + 1;
+        const file = fs.createReadStream(filePath, {start, end});
         
-        // Loop through files and extract metadata
-        const songData = await Promise.all(files.map(async (file) => {
-            const filePath = path.join(musicPath, file);
-            const metadata = await mm.parseFile(filePath);
-            
-            return {
-                filename: file,
-                title: metadata.common.title || file,
-                artist: metadata.common.artist || "Unknown Artist",
-                album: metadata.common.album || "Unknown Album",
-                duration: metadata.format.duration
-            };
-        }));
-
-        res.json(songData);
-    } catch (err) {
-        res.status(500).json({ error: "Failed to scan folder" });
-    }
-});
-
-// NEW ROUTE: Fetch album art for a specific song
-app.get('/api/art', async (req, res) => {
-    const songName = req.query.name;
-    const filePath = path.join(getSavedPath(), songName);
-
-    try {
-        const metadata = await mm.parseFile(filePath);
-        const picture = metadata.common.picture && metadata.common.picture[0];
-
-        if (picture) {
-            res.contentType(picture.format);
-            res.send(picture.data);
-        } else {
-            // Send a default placeholder if no art exists
-            res.redirect('https://via.placeholder.com/300?text=No+Cover');
-        }
-    } catch (err) {
-        res.status(404).send("Art not found");
+        res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunksize,
+            'Content-Type': 'audio/mpeg',
+        });
+        file.pipe(res);
+    } else {
+        res.writeHead(200, {
+            'Content-Length': stat.size,
+            'Content-Type': 'audio/mpeg',
+        });
+        fs.createReadStream(filePath).pipe(res);
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Server started at http://localhost:${PORT}`);
+    console.log(`Server running at http://localhost:${PORT}`);
 });
