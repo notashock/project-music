@@ -1,9 +1,14 @@
-const fs = require('fs');
-const path = require('path');
-const mm = require('music-metadata');
-const Song = require('../models/Song');
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import * as mm from 'music-metadata';
+import Song from '../models/Song.js';
+import RootFolder from '../models/RootFolder.js';
 
-// Helper function to recursively find all MP3s in a directory
+// ES Module polyfill for __dirname
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Helper function to recursively find all MP3s
 async function getMp3Files(dir) {
     let results = [];
     const list = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -19,85 +24,180 @@ async function getMp3Files(dir) {
 }
 
 // ==========================================
-// THE SMART SCANNER FUNCTION
+// 1. STAGE SCAN (Hybrid: Target or Global)
 // ==========================================
-exports.scanLibrary = async (req, res) => {
+export const stageScan = async (req, res) => {
     try {
-        const musicDir = process.env.MUSIC_DIR || req.body.folderPath;
+        // Safely extract folderPath (handles cases where req.body is empty)
+        const folderPath = req.body?.folderPath;
+        let rootFoldersToScan = [];
 
-        if (!musicDir || !fs.existsSync(musicDir)) {
-            return res.status(400).json({ error: `Music directory not found: ${musicDir}` });
+        // Scenario A: User provided a specific folder path
+        if (folderPath) {
+            if (!fs.existsSync(folderPath)) {
+                return res.status(404).json({ error: `Directory not found on disk: ${folderPath}` });
+            }
+
+            let rootDoc = await RootFolder.findOne({ path: folderPath });
+            if (!rootDoc) {
+                const safeFolderName = folderPath.replace(/[^a-zA-Z0-9]/g, '_');
+                const rootThumbDir = path.join(__dirname, '..', 'metadata', 'thumbnails', safeFolderName);
+                
+                if (!fs.existsSync(rootThumbDir)) {
+                    fs.mkdirSync(rootThumbDir, { recursive: true });
+                }
+
+                rootDoc = await RootFolder.create({
+                    path: folderPath,
+                    name: path.basename(folderPath),
+                    thumb_path: rootThumbDir
+                });
+            }
+            rootFoldersToScan.push(rootDoc);
+
+        } else {
+            // Scenario B: Global Sync (No path provided)
+            rootFoldersToScan = await RootFolder.find();
+            if (rootFoldersToScan.length === 0) {
+                return res.status(400).json({ 
+                    error: "No existing root folders found in database. Please provide a folderPath to register one." 
+                });
+            }
         }
 
-        const thumbDir = path.join(__dirname, '..', 'metadata', 'thumbnails');
-        if (!fs.existsSync(thumbDir)) {
-            fs.mkdirSync(thumbDir, { recursive: true });
-        }
+        let totalAddedCount = 0;
+        let scanErrors = [];
 
-        // 1. Get all MP3s currently on the hard drive
-        const diskFiles = await getMp3Files(musicDir);
+        // Loop through the determined folder(s) safely
+        for (const rootDoc of rootFoldersToScan) {
+            try {
+                if (!fs.existsSync(rootDoc.path)) {
+                    console.warn(`⚠️ Skipping missing directory: ${rootDoc.path}`);
+                    continue; 
+                }
 
-        // 2. Get all songs currently in the database
-        // We only select 'full_path' to save memory
-        const existingSongs = await Song.find({}, 'full_path');
-        
-        // Convert to a Set for lightning-fast lookups
-        const existingPaths = new Set(existingSongs.map(song => song.full_path));
+                if (!fs.existsSync(rootDoc.thumb_path)) {
+                    fs.mkdirSync(rootDoc.thumb_path, { recursive: true });
+                }
 
-        // 3. Filter out files that are already in the database
-        const newFiles = diskFiles.filter(file => !existingPaths.has(file.fullPath));
+                const diskFiles = await getMp3Files(rootDoc.path);
+                const existingDocs = await Song.find({ root_folder: rootDoc._id }, { relative_path: 1, _id: 0 }).lean();
+                const existingSet = new Set(existingDocs.map(doc => doc.relative_path));
 
-        let addedCount = 0;
+                const newFiles = diskFiles.filter(file => !existingSet.has(path.relative(rootDoc.path, file.fullPath)));
 
-        // 4. ONLY process the brand new files
-        if (newFiles.length > 0) {
-            console.log(`Detected ${newFiles.length} new songs. Processing...`);
-            
-            for (const file of newFiles) {
-                try {
-                    const metadata = await mm.parseFile(file.fullPath);
-                    const title = metadata.common.title || file.name.replace('.mp3', '');
-                    const artist = metadata.common.artist || 'Unknown Artist';
-                    const album = metadata.common.album || 'Unknown Album';
-                    let thumbnailPath = null;
+                if (newFiles.length === 0) continue; 
 
-                    const picture = metadata.common.picture?.[0];
-                    if (picture) {
-                        const thumbName = `${title}_${artist}`.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '.jpg';
-                        const thumbFullPath = path.join(thumbDir, thumbName);
-                        fs.writeFileSync(thumbFullPath, picture.data);
-                        thumbnailPath = thumbFullPath;
-                    }
+                const BATCH_SIZE = 50;
+                for (let i = 0; i < newFiles.length; i += BATCH_SIZE) {
+                    const chunk = newFiles.slice(i, i + BATCH_SIZE);
+                    
+                    const chunkPromises = chunk.map(async (file) => {
+                        const relative_path = path.relative(rootDoc.path, file.fullPath);
+                        try {
+                            const metadata = await mm.parseFile(file.fullPath);
+                            const title = metadata.common.title || file.name.replace('.mp3', '');
+                            const artist = metadata.common.artist || 'Unknown Artist';
+                            
+                            let thumbName = null;
+                            const picture = metadata.common.picture?.[0];
+                            if (picture) {
+                                thumbName = `${title}_${artist}`.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '.jpg';
+                                const thumbFullPath = path.join(rootDoc.thumb_path, thumbName);
+                                if (!fs.existsSync(thumbFullPath)) fs.writeFileSync(thumbFullPath, picture.data);
+                            }
 
-                    // Use .create() since we already proved it doesn't exist in the DB
-                    await Song.create({
-                        filename: file.name,
-                        full_path: file.fullPath,
-                        title,
-                        artist,
-                        album,
-                        thumbnail_path: thumbnailPath
+                            return {
+                                filename: file.name,
+                                relative_path: relative_path,
+                                root_folder: rootDoc._id, 
+                                title,
+                                artist,
+                                album: metadata.common.album || 'Unknown Album',
+                                thumbnail_path: thumbName,
+                                is_confirmed: false // STAGED
+                            };
+                        } catch (err) {
+                            console.warn(`Could not parse metadata for ${file.name}:`, err.message);
+                            return null; // Skip corrupted files without crashing the whole scan
+                        }
                     });
 
-                    addedCount++;
-                    console.log(`➕ Added: ${title}`);
-                } catch (err) {
-                    console.error(`Skipping unreadable file ${file.name}:`, err.message);
+                    const validSongs = (await Promise.all(chunkPromises)).filter(song => song !== null);
+                    if (validSongs.length > 0) {
+                        await Song.insertMany(validSongs, { ordered: false });
+                        totalAddedCount += validSongs.length;
+                    }
                 }
+            } catch (folderError) {
+                console.error(`❌ Error processing folder ${rootDoc.path}:`, folderError);
+                scanErrors.push(`Failed on ${rootDoc.name}: ${folderError.message}`);
             }
-        } else {
-            console.log("Library is already up to date.");
         }
 
         res.status(200).json({ 
-            message: "Boom! Sync complete", 
-            totalFilesOnDisk: diskFiles.length,
-            newSongsAdded: addedCount 
+            message: "Scan cycle complete.", 
+            newSongsStaged: totalAddedCount,
+            foldersScanned: rootFoldersToScan.length,
+            errors: scanErrors.length > 0 ? scanErrors : undefined
         });
 
     } catch (error) {
-        console.error("Scanning error:", error);
-        res.status(500).json({ error: "Failed to scan library" });
+        // 🚀 EXPOSE THE REAL ERROR TO POSTMAN
+        console.error("CRITICAL Scan error:", error);
+        res.status(500).json({ 
+            error: "Failed to scan libraries", 
+            details: error.message 
+        });
+    }
+};
+
+// ==========================================
+// 2. COMMIT SCAN
+// ==========================================
+export const confirmScan = async (req, res) => {
+    try {
+        const result = await Song.updateMany(
+            { is_confirmed: false }, 
+            { $set: { is_confirmed: true } }
+        );
+
+        res.status(200).json({ 
+            message: "Library updated successfully!", 
+            songsConfirmed: result.modifiedCount 
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to confirm songs" });
+    }
+};
+
+// ==========================================
+// 3. ROLLBACK SCAN 
+// ==========================================
+export const rollbackScan = async (req, res) => {
+    try {
+        const stagedSongs = await Song.find({ is_confirmed: false }).populate('root_folder');
+        let deletedThumbs = 0;
+        
+        stagedSongs.forEach(song => {
+            if (song.thumbnail_path && song.root_folder) {
+                const thumbFullPath = path.join(song.root_folder.thumb_path, song.thumbnail_path);
+                if (fs.existsSync(thumbFullPath)) {
+                    fs.unlinkSync(thumbFullPath);
+                    deletedThumbs++;
+                }
+            }
+        });
+
+        const result = await Song.deleteMany({ is_confirmed: false });
+
+        res.status(200).json({ 
+            message: "Scan discarded safely.",
+            songsRemoved: result.deletedCount,
+            thumbnailsCleaned: deletedThumbs
+        });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to rollback scan" });
     }
 };
 
@@ -105,20 +205,20 @@ exports.scanLibrary = async (req, res) => {
 // CRUD OPERATIONS
 // ==========================================
 
-// READ ALL
-exports.getAllSongs = async (req, res) => {
+export const getAllSongs = async (req, res) => {
     try {
-        const songs = await Song.find().sort({ createdAt: -1 });
+        const songs = await Song.find({ is_confirmed: true })
+            .populate('root_folder', 'path name thumb_path') 
+            .sort({ createdAt: -1 });
         res.status(200).json(songs);
     } catch (error) {
         res.status(500).json({ error: "Failed to fetch songs" });
     }
 };
 
-// READ ONE
-exports.getSongById = async (req, res) => {
+export const getSongById = async (req, res) => {
     try {
-        const song = await Song.findById(req.params.id);
+        const song = await Song.findById(req.params.id).populate('root_folder', 'path name thumb_path');
         if (!song) return res.status(404).json({ message: "Song not found" });
         res.status(200).json(song);
     } catch (error) {
@@ -126,17 +226,19 @@ exports.getSongById = async (req, res) => {
     }
 };
 
-// DELETE
-exports.deleteSong = async (req, res) => {
+export const deleteSong = async (req, res) => {
     try {
-        const song = await Song.findByIdAndDelete(req.params.id);
+        const song = await Song.findById(req.params.id).populate('root_folder');
         if (!song) return res.status(404).json({ message: "Song not found" });
         
-        // Optional: Also delete the thumbnail from the hard drive here to save space
-        if (song.thumbnail_path && fs.existsSync(song.thumbnail_path)) {
-            fs.unlinkSync(song.thumbnail_path);
+        if (song.thumbnail_path && song.root_folder && song.root_folder.thumb_path) {
+            const thumbFullPath = path.join(song.root_folder.thumb_path, song.thumbnail_path);
+            if (fs.existsSync(thumbFullPath)) {
+                fs.unlinkSync(thumbFullPath);
+            }
         }
 
+        await Song.findByIdAndDelete(req.params.id);
         res.status(200).json({ message: "Song deleted from database" });
     } catch (error) {
         res.status(500).json({ error: "Failed to delete song" });
