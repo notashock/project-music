@@ -1,17 +1,13 @@
-// config/dbconfig.js
-const mongoose = require('mongoose');
+import mongoose from 'mongoose';
 
 const connectDB = async () => {
     try {
-        // process.env allows Node to read the variables from your .env file
-        const conn = await mongoose.connect(process.env.MONGO_URI);
-        
-        console.log(`✅ Boom! MongoDB Connected: ${conn.connection.host}`);
+        await mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/music_vault');
+        console.log('✅ MongoDB Connected');
     } catch (error) {
-        console.error(`❌ Connection error: ${error.message}`);
-        // Exit process with failure if the database connection drops
+        console.error('❌ DB Error:', error);
         process.exit(1);
     }
 };
 
-module.exports = connectDB;
+export default connectDB;
