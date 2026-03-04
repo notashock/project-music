@@ -1,29 +1,27 @@
-import 'dotenv/config'; // Modern ES Module way to load .env
+import 'dotenv/config'; 
 import express from 'express';
+import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import os from 'os'; // 🚀 NEW: Required to find your local network IP
 import { fileURLToPath } from 'url';
 
-// 🚀 CRITICAL: All local imports must include the .js extension!
 import connectDB from './config/dbconfig.js'; 
 import songRoutes from './routes/songRoutes.js';
 import rootRoutes from './routes/rootRoutes.js';
 import Song from './models/Song.js';
 
-// 🚀 ES Module polyfill to recreate __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT;
+// 🚀 Added a fallback port just in case .env is missing it
+const PORT = process.env.PORT || 5000;
 
-// Connect to Local MongoDB
 connectDB();
 
-// Middleware
 app.use(express.json());
-
-// Mount API Routes
+app.use(cors())
 app.use('/api/songs', songRoutes);
 app.use('/api/roots', rootRoutes);
 
@@ -107,7 +105,30 @@ app.get('/stream', async (req, res) => {
     }
 });
 
-// Start the server
-app.listen(PORT, () => {
-    console.log(`🚀 Pure Backend running at http://localhost:${PORT}`);
+// ==========================================
+// NETWORK BROADCAST INITIALIZATION
+// ==========================================
+const getLocalIP = () => {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            // Find the IPv4 address that is not internal (not 127.0.0.1)
+            if (iface.family === 'IPv4' && !iface.internal) {
+                return iface.address;
+            }
+        }
+    }
+    return 'localhost';
+};
+
+// 🚀 Binding to '0.0.0.0' explicitly exposes the server to the local network
+app.listen(PORT, '0.0.0.0', () => {
+    const ip = getLocalIP();
+    console.log(`
+    🎵 MUSIC SERVER STATUS: ONLINE
+    --------------------------------------
+    🏠 Local Admin: http://localhost:${PORT}
+    📡 AIR Streaming: http://${ip}:${PORT}
+    --------------------------------------
+    `);
 });
