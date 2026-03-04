@@ -5,8 +5,9 @@ import {
     rollbackScan, 
     getAllSongs, 
     getSongById, 
-    deleteSong 
-} from '../controllers/songController.js'; // 🚀 CRITICAL: Do not forget the .js extension!
+    deleteSong,
+    getDuplicates // 🚀 Added the new duplicate function
+} from '../controllers/songController.js'; 
 
 const router = express.Router();
 
@@ -22,6 +23,14 @@ router.post('/scan/confirm', confirmScan);
 
 // 3. Rollback the scan (Deletes staged songs and cleans up thumbnails)
 router.post('/scan/rollback', rollbackScan);
+
+// ==========================================
+// UTILITY & DUPLICATE MANAGEMENT
+// ==========================================
+
+// 🚀 CRITICAL: Static routes must go BEFORE dynamic (/:id) routes!
+// Find logical duplicates based on metadata
+router.get('/duplicates', getDuplicates);
 
 // ==========================================
 // STANDARD CRUD OPERATIONS
