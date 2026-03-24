@@ -1,14 +1,48 @@
-// routes/songRoutes.js
-const express = require('express');
+import express from 'express';
+import { 
+    stageScan, 
+    confirmScan, 
+    rollbackScan, 
+    getAllSongs, 
+    getSongById, 
+    deleteSong,
+    getDuplicates // 🚀 Added the new duplicate function
+} from '../controllers/songController.js'; 
+
 const router = express.Router();
-const songController = require('../controllers/songController');
 
-// Trigger the scanner (Send a POST request here to update the library)
-router.post('/scan', songController.scanLibrary);
+// ==========================================
+// TRANSACTIONAL SCANNER ROUTES
+// ==========================================
 
-// Standard CRUD operations
-router.get('/', songController.getAllSongs);
-router.get('/:id', songController.getSongById);
-router.delete('/:id', songController.deleteSong);
+// 1. Stage the scan (Finds new songs and holds them in a 'pending' state)
+router.post('/scan/stage', stageScan);
 
-module.exports = router;
+// 2. Confirm the scan (Changes 'is_confirmed' to true)
+router.post('/scan/confirm', confirmScan);
+
+// 3. Rollback the scan (Deletes staged songs and cleans up thumbnails)
+router.post('/scan/rollback', rollbackScan);
+
+// ==========================================
+// UTILITY & DUPLICATE MANAGEMENT
+// ==========================================
+
+// 🚀 CRITICAL: Static routes must go BEFORE dynamic (/:id) routes!
+// Find logical duplicates based on metadata
+router.get('/duplicates', getDuplicates);
+
+// ==========================================
+// STANDARD CRUD OPERATIONS
+// ==========================================
+
+// Get all confirmed songs
+router.get('/', getAllSongs);
+
+// Get a specific song by ID
+router.get('/:id', getSongById);
+
+// Delete a specific song from the library
+router.delete('/:id', deleteSong);
+
+export default router;
